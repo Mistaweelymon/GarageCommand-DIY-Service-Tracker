@@ -1,0 +1,1371 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#020617" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="GarageCommand" />
+  <title>GarageCommand Pro — DIY Service, Expense & Tool Readiness Tracker</title>
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Babel Standalone for In-Browser JSX Compilation -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Import Map for React 18 & Lucide Icons -->
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.3.1",
+        "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+        "lucide-react": "https://esm.sh/lucide-react@0.460.0?deps=react@18.3.1"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      background-color: #020617;
+      color: #f1f5f9;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 antialiased">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    import React, { useState, useEffect, useMemo } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import {
+      Car,
+      Wrench,
+      ClipboardList,
+      BookOpen,
+      Plus,
+      CheckCircle2,
+      AlertTriangle,
+      XCircle,
+      Search,
+      Download,
+      Upload,
+      RotateCcw,
+      Edit3,
+      Trash2,
+      Gauge,
+      DollarSign,
+      Calendar,
+      ChevronRight,
+      Check,
+      X,
+      ShieldCheck,
+      Sparkles,
+      Droplets,
+      Clock,
+      Tag,
+      Package,
+      Camera,
+      Image as ImageIcon,
+      Copy,
+      ArrowUpDown,
+      Database,
+      Store,
+      Minus,
+      Cloud,
+      CloudOff,
+      RefreshCw,
+      Smartphone,
+      KeyRound
+    } from 'lucide-react';
+
+    // ==========================================
+    // SUPABASE CLOUD SYNC CONFIGURATION
+    // ==========================================
+    const DEFAULT_SUPABASE_URL = '';
+    const DEFAULT_SUPABASE_ANON_KEY = '';
+    const DEFAULT_GARAGE_SYNC_CODE = 'JETTA-GARAGE-1';
+
+    const LOCAL_STORAGE_STATE_KEY = 'garage_command_pro_v3_state';
+    const LOCAL_STORAGE_CONFIG_KEY = 'garage_command_pro_v3_supabase_cfg';
+
+    const copyTextToClipboard = async (text) => {
+      const str = String(text ?? '');
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(str);
+          return true;
+        }
+      } catch (err) {}
+      try {
+        const textArea = document.createElement('textarea');
+        textArea.value = str;
+        textArea.setAttribute('readonly', '');
+        textArea.style.position = 'fixed';
+        textArea.style.top = '-9999px';
+        textArea.style.left = '-9999px';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textArea);
+        return copied;
+      } catch (fallbackErr) {
+        return false;
+      }
+    };
+
+    const SUPABASE_SETUP_SQL = `-- Run this once in your Supabase SQL Editor:
+create table if not exists public.garage_state (
+  sync_code text primary key,
+  payload jsonb not null,
+  updated_at timestamptz default now(),
+  client_id text
+);
+
+alter table public.garage_state enable row level security;
+
+drop policy if exists "Allow anon read/write by sync_code" on public.garage_state;
+create policy "Allow anon read/write by sync_code"
+  on public.garage_state
+  for all
+  to anon, authenticated
+  using (true)
+  with check (true);`;
+
+    const normalizeSupabaseUrl = (rawInput) => {
+      const trimmed = (rawInput || '').trim().replace(/\/+$/, '');
+      if (!trimmed) return '';
+      const dashMatch = trimmed.match(/supabase\.com\/dashboard\/project\/([a-z0-9]+)/i);
+      if (dashMatch && dashMatch[1]) {
+        return `https://${dashMatch[1].toLowerCase()}.supabase.co`;
+      }
+      if (/^[a-z0-9]{15,25}$/i.test(trimmed)) {
+        return `https://${trimmed.toLowerCase()}.supabase.co`;
+      }
+      if (!/^https?:\/\//i.test(trimmed) && trimmed.includes('.supabase.co')) {
+        return `https://${trimmed}`;
+      }
+      return trimmed;
+    };
+
+    const supabaseRestPull = async (url, anonKey, syncCode) => {
+      const cleanUrl = normalizeSupabaseUrl(url);
+      const cleanCode = encodeURIComponent(syncCode.trim().toUpperCase());
+      const endpoint = `${cleanUrl}/rest/v1/garage_state?sync_code=eq.${cleanCode}&select=sync_code,payload,updated_at,client_id`;
+      const res = await fetch(endpoint, {
+        method: 'GET',
+        headers: {
+          apikey: anonKey.trim(),
+          Authorization: `Bearer ${anonKey.trim()}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Supabase Pull HTTP ${res.status}: ${errText}`);
+      }
+      const rows = await res.json();
+      return rows && rows.length > 0 ? rows[0] : null;
+    };
+
+    const supabaseRestPush = async (url, anonKey, syncCode, payloadObj, clientId) => {
+      const cleanUrl = normalizeSupabaseUrl(url);
+      const cleanCode = syncCode.trim().toUpperCase();
+      const endpoint = `${cleanUrl}/rest/v1/garage_state?on_conflict=sync_code`;
+      const body = {
+        sync_code: cleanCode,
+        payload: payloadObj,
+        updated_at: new Date().toISOString(),
+        client_id: clientId
+      };
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          apikey: anonKey.trim(),
+          Authorization: `Bearer ${anonKey.trim()}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=representation'
+        },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Supabase Push HTTP ${res.status}: ${errText}`);
+      }
+      const rows = await res.json();
+      return rows && rows.length > 0 ? rows[0] : body;
+    };
+
+    const compressImageFile = (file, maxWidth = 800, quality = 0.72) => {
+      return new Promise((resolve) => {
+        if (!file) {
+          resolve(null);
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let width = img.width;
+            let height = img.height;
+            if (width > maxWidth) {
+              height = Math.round((height * maxWidth) / width);
+              width = maxWidth;
+            }
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+          };
+          img.onerror = () => resolve(event.target.result);
+          img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    };
+
+    // ==========================================
+    // INITIAL DEMO DATA
+    // ==========================================
+    const INITIAL_VEHICLES = [
+      {
+        id: 'v-jetta-2017',
+        year: 2017,
+        make: 'Volkswagen',
+        model: 'Jetta',
+        trim: 'TSI 1.8L Turbo (White / Gunmetal)',
+        odometer: 168000,
+        vinPlate: 'VW-17TSI',
+        oilSpec: 'MAG 1 SAE 5W-30 Full Synthetic (5.7 qt, VW 502 00)',
+        coolantSpec: 'Peak European Violet G12++/G13 50/50 Prediluted',
+        sparkPlugSpec: 'NGK Laser Platinum (5/8" socket, 22 lb-ft)',
+        lugTorqueSpec: '89 lb-ft (17mm Lug Bolts)',
+        wiperSizes: '24" Driver / 19" Passenger | Tail Light Bulb: 2825',
+        notes: 'Spark plugs: 5/8" magnetic socket, 22 lb-ft torque. Tail light bulb: 2825 wedge. Uses Torx T25 for belly pan screws and Triple-Square (XZN) bits for rear caliper carrier bolts & sway bar links.',
+        partNumbers: [
+          { id: 'pn-1', part: 'Engine Oil Filter Cartridge', number: 'Mann HU 7020 z / OEM 06L115562', vendor: 'FCP Euro / AutoZone' },
+          { id: 'pn-2', part: 'Spark Plugs (4x)', number: 'NGK 94833 (PLFER7A8EG)', vendor: 'NGK / Bosch' },
+          { id: 'pn-3', part: 'Tail Light Wedge Bulb', number: 'Sylvania 2825 (W5W)', vendor: 'Walmart / AutoZone' },
+          { id: 'pn-4', part: 'Cabin Air Filter (Carbon)', number: 'Mann CUK 2939', vendor: 'Amazon / FCP Euro' },
+          { id: 'pn-5', part: 'Oil Drain Plug & Crush Washer', number: 'N90813202 (19mm Hex)', vendor: 'OEM VW' }
+        ],
+        photos: [],
+        color: 'from-blue-600 to-indigo-700'
+      },
+      {
+        id: 'v-highlander-2021',
+        year: 2021,
+        make: 'Toyota',
+        model: 'Highlander',
+        trim: 'XLE 3.5L V6 AWD',
+        odometer: 54200,
+        vinPlate: 'TY-21XLE',
+        oilSpec: 'SAE 0W-20 Full Synthetic (6.1 qt, ILSAC GF-6A)',
+        coolantSpec: 'Toyota Super Long Life Pink 50/50',
+        sparkPlugSpec: 'Denso Iridium Long Life (14mm thin-wall socket, 15 lb-ft)',
+        lugTorqueSpec: '80 lb-ft (21mm Lug Nuts)',
+        wiperSizes: '26" Driver / 20" Passenger / 12" Rear',
+        notes: 'Uses 64mm 14-flute cartridge oil filter housing wrench. Lug nut torque: 80 lb-ft (21mm socket). Replace aluminum drain plug crush washer every oil change.',
+        partNumbers: [
+          { id: 'pn-6', part: 'Oil Filter Cartridge Element', number: 'Toyota OEM 04152-YZZA1', vendor: 'Toyota Dealership / Walmart' },
+          { id: 'pn-7', part: 'Drain Plug Crush Gasket', number: 'Toyota 90430-12031', vendor: 'OEM Toyota' },
+          { id: 'pn-8', part: 'Iridium Spark Plugs (6x)', number: 'Denso FK20HBR8', vendor: 'RockAuto / Denso' },
+          { id: 'pn-9', part: 'Engine Air Filter', number: 'Toyota 17801-0P100', vendor: 'OEM Toyota' }
+        ],
+        photos: [],
+        color: 'from-emerald-600 to-teal-700'
+      }
+    ];
+
+    const INITIAL_SHELF = [
+      {
+        id: 's-mag1-oil',
+        name: 'MAG 1 SAE 5W-30 Full Synthetic Euro Oil',
+        category: 'Fluids',
+        vehicleId: 'v-jetta-2017',
+        partNumber: 'MAG1-62096',
+        quantity: 6,
+        minQuantity: 6,
+        unit: 'quarts',
+        unitCost: 6.49,
+        notes: 'FMX European Formula for 2017 Jetta 1.8T (takes 5.7 qt per change)'
+      },
+      {
+        id: 's-mann-filter',
+        name: 'Mann Oil Filter (VW 1.8T)',
+        category: 'Filters',
+        vehicleId: 'v-jetta-2017',
+        partNumber: 'Mann HU 7020 z',
+        quantity: 1,
+        minQuantity: 1,
+        unit: 'filter',
+        unitCost: 11.99,
+        notes: 'Includes O-ring gasket'
+      },
+      {
+        id: 's-peak-coolant',
+        name: 'Peak OET European Violet G12++/G13 50/50 Coolant',
+        category: 'Fluids',
+        vehicleId: 'v-jetta-2017',
+        partNumber: 'PEAK-PEVB53',
+        quantity: 1,
+        minQuantity: 1,
+        unit: 'gallon jug',
+        unitCost: 18.99,
+        notes: 'Half jug remaining from last top-off'
+      },
+      {
+        id: 's-2825-bulb',
+        name: '2825 Miniature Wedge Bulb (Tail Light)',
+        category: 'Bulbs & Electrical',
+        vehicleId: 'v-jetta-2017',
+        partNumber: 'Sylvania 2825 LL',
+        quantity: 1,
+        minQuantity: 1,
+        unit: 'bulb',
+        unitCost: 3.25,
+        notes: '1 spare bulb left from 2-pack'
+      },
+      {
+        id: 's-ngk-plugs',
+        name: 'NGK Laser Platinum Spark Plugs (VW 1.8T)',
+        category: 'Ignition',
+        vehicleId: 'v-jetta-2017',
+        partNumber: 'NGK 94833',
+        quantity: 0,
+        minQuantity: 4,
+        unit: 'plugs',
+        unitCost: 13.99,
+        notes: 'Used all 4 on recent tune-up'
+      },
+      {
+        id: 's-toyota-filter',
+        name: 'Toyota OEM Oil Filter Cartridge (04152-YZZA1)',
+        category: 'Filters',
+        vehicleId: 'v-highlander-2021',
+        partNumber: '04152-YZZA1',
+        quantity: 2,
+        minQuantity: 1,
+        unit: 'filters',
+        unitCost: 6.50,
+        notes: 'Includes filter element & housing O-rings'
+      },
+      {
+        id: 's-0w20-oil',
+        name: '0W-20 Full Synthetic Motor Oil',
+        category: 'Fluids',
+        vehicleId: 'v-highlander-2021',
+        partNumber: 'Mobil1-0W20',
+        quantity: 3,
+        minQuantity: 6,
+        unit: 'quarts',
+        unitCost: 5.99,
+        notes: 'Need 3 more quarts before next Highlander oil change (6.1 qt capacity)'
+      },
+      {
+        id: 's-dot4-fluid',
+        name: 'DOT 4 Synthetic Brake Fluid',
+        category: 'Fluids',
+        vehicleId: 'ALL',
+        partNumber: 'Pentosin Super DOT 4',
+        quantity: 1,
+        minQuantity: 2,
+        unit: 'bottles (500ml)',
+        unitCost: 12.99,
+        notes: 'Unopened bottle on top shelf'
+      },
+      {
+        id: 's-brake-cleaner',
+        name: 'Non-Chlorinated Brake Parts Cleaner',
+        category: 'Shop Supplies',
+        vehicleId: 'ALL',
+        partNumber: 'CRC-05088',
+        quantity: 2,
+        minQuantity: 1,
+        unit: 'cans',
+        unitCost: 5.49,
+        notes: 'Essential for brake & oil jobs'
+      }
+    ];
+
+    const INITIAL_TOOLS = [
+      { id: 't-metric-sockets', name: 'Metric Socket Set (8mm - 19mm)', category: 'Sockets & Bits', owned: true, loanerAvailable: false, estBuyPrice: 45, notes: '6-point standard and deep sockets' },
+      { id: 't-spark-58', name: '5/8" Magnetic Spark Plug Socket', category: 'Sockets & Bits', owned: true, loanerAvailable: false, estBuyPrice: 12, notes: 'Fits 2017 VW Jetta 1.8T & most domestic/Euro plugs' },
+      { id: 't-spark-14mm', name: '14mm Thin-Wall Spark Plug Socket', category: 'Sockets & Bits', owned: false, loanerAvailable: false, estBuyPrice: 14, notes: 'Needed for Toyota 3.5L V6 & modern tight plug wells' },
+      { id: 't-torx-set', name: 'Torx Bit Socket Set (T15 - T55)', category: 'Sockets & Bits', owned: true, loanerAvailable: false, estBuyPrice: 28, notes: 'Crucial for VW belly pan (T25), airbox & PCV screws' },
+      { id: 't-triple-square', name: 'Triple-Square (XZN) Bit Set (M6 - M16)', category: 'Sockets & Bits', owned: false, loanerAvailable: true, estBuyPrice: 26, notes: 'Required for VW rear caliper carriers (M14) & sway bar links' },
+      { id: 't-hex-allen', name: 'Metric Hex / Allen Bit Socket Set (4mm - 12mm)', category: 'Sockets & Bits', owned: true, loanerAvailable: false, estBuyPrice: 22, notes: 'For caliper guide pins & transmission level plugs' },
+      { id: 't-lug-sockets', name: '17mm & 21mm Thin-Wall Deep Impact Sockets', category: 'Sockets & Bits', owned: true, loanerAvailable: false, estBuyPrice: 19, notes: '17mm for VW Jetta lug bolts; 21mm for Toyota Highlander lug nuts' },
+      { id: 't-ratchet-38', name: '3/8" Drive Ratchet & Extensions', category: 'Wrenches & Ratchets', owned: true, loanerAvailable: false, estBuyPrice: 35, notes: 'Includes 3", 6", and 10" extension bars' },
+      { id: 't-torque-38', name: 'Torque Wrench (3/8" Drive, 10-80 lb-ft)', category: 'Wrenches & Ratchets', owned: true, loanerAvailable: true, estBuyPrice: 45, notes: 'Ideal for spark plugs (22 lb-ft) & drain plugs' },
+      { id: 't-torque-12', name: 'Torque Wrench (1/2" Drive, 30-250 lb-ft)', category: 'Wrenches & Ratchets', owned: true, loanerAvailable: true, estBuyPrice: 60, notes: 'For lug bolts (89 lb-ft VW / 80 lb-ft Toyota) & suspension' },
+      { id: 't-combo-wrenches', name: 'Metric Combination Wrench Set (8mm - 19mm)', category: 'Wrenches & Ratchets', owned: true, loanerAvailable: false, estBuyPrice: 38, notes: 'Open and box-end metric wrenches' },
+      { id: 't-flare-wrenches', name: '10mm & 11mm Flare Nut (Line) Wrench Set', category: 'Wrenches & Ratchets', owned: false, loanerAvailable: false, estBuyPrice: 18, notes: 'Prevents rounding soft brake caliper bleeder nipples' },
+      { id: 't-breaker-bar', name: '1/2" Drive 24" Breaker Bar', category: 'Wrenches & Ratchets', owned: true, loanerAvailable: false, estBuyPrice: 25, notes: 'High leverage for lug nuts and carrier bolts' },
+      { id: 't-caliper-compressor', name: 'Brake Caliper Piston Wind-Back Kit', category: 'Specialty & Diagnostics', owned: false, loanerAvailable: true, estBuyPrice: 32, notes: 'Free Loan-A-Tool at AutoZone/Advance! Rotates & presses VW rear pistons' },
+      { id: 't-toyota-filter-cup', name: 'Toyota 64mm 14-Flute Oil Filter Socket', category: 'Specialty & Diagnostics', owned: false, loanerAvailable: false, estBuyPrice: 15, notes: 'Heavy-duty aluminum cup wrench for Toyota 3.5L V6 filter housing' },
+      { id: 't-serpentine-tool', name: 'Long-Reach Serpentine Belt Tensioner Tool', category: 'Specialty & Diagnostics', owned: false, loanerAvailable: true, estBuyPrice: 29, notes: 'Loan-A-Tool eligible; reaches narrow transverse belt tensioners' },
+      { id: 't-brake-bleeder', name: 'One-Person Vacuum Brake Bleeder Kit', category: 'Specialty & Diagnostics', owned: false, loanerAvailable: true, estBuyPrice: 34, notes: 'For solo brake fluid flushes' },
+      { id: 't-fluid-pump', name: 'Fluid Transfer Pump & Fill Adapter', category: 'Specialty & Diagnostics', owned: false, loanerAvailable: false, estBuyPrice: 18, notes: 'Pumps ATF/gear oil upward into transmission fill ports' },
+      { id: 't-wheel-hanger', name: 'M14x1.5 Wheel Hanger Alignment Pin', category: 'Specialty & Diagnostics', owned: true, loanerAvailable: false, estBuyPrice: 11, notes: 'Holds heavy VW wheels on hub while threading lug bolts' },
+      { id: 't-obd2-scanner', name: 'OBDII Diagnostic Scanner & EPB Tool', category: 'Specialty & Diagnostics', owned: true, loanerAvailable: true, estBuyPrice: 65, notes: 'Reads CEL codes, ATF temp & retracts Electronic Parking Brakes' },
+      { id: 't-multimeter', name: 'Digital Multimeter & 12V Battery Tester', category: 'Specialty & Diagnostics', owned: true, loanerAvailable: true, estBuyPrice: 25, notes: 'Tests resting voltage (12.6V) and alternator output (14.2V)' },
+      { id: 't-jack-stands', name: 'Hydraulic Floor Jack & 3-Ton Jack Stands', category: 'Lifting & Garage', owned: true, loanerAvailable: false, estBuyPrice: 165, notes: 'Always use jack stands + wheel chocks' },
+      { id: 't-drain-pan-funnel', name: 'Oil Drain Pan & Spill-Free Funnel Set', category: 'Lifting & Garage', owned: true, loanerAvailable: false, estBuyPrice: 20, notes: '15-quart catch pan + clean oil funnel' },
+      { id: 't-filter-pliers', name: 'Adjustable Oil Filter Wrench / Pliers', category: 'Lifting & Garage', owned: true, loanerAvailable: false, estBuyPrice: 14, notes: 'For spin-on and cartridge housings' },
+      { id: 't-gloves-glasses', name: 'Nitrile Gloves & Safety Glasses', category: 'Lifting & Garage', owned: true, loanerAvailable: false, estBuyPrice: 12, notes: 'Personal protective equipment' },
+      { id: 't-screwdrivers', name: 'Phillips & Flathead Screwdriver Set', category: 'Pliers & Drivers', owned: true, loanerAvailable: false, estBuyPrice: 20, notes: 'Assorted sizes' },
+      { id: 't-trim-tools', name: 'Nylon Trim & Panel Removal Tool Set', category: 'Pliers & Drivers', owned: true, loanerAvailable: false, estBuyPrice: 11, notes: 'Non-marring pry tools for tail light access panels & clips' },
+      { id: 't-hose-clamp-pliers', name: 'Spring Hose Clamp Pliers & Pick Set', category: 'Pliers & Drivers', owned: true, loanerAvailable: false, estBuyPrice: 18, notes: 'For intake boots, radiator hoses, and PCV breather clips' }
+    ];
+
+    const INITIAL_GUIDES = [
+      {
+        id: 'g-1-oil-vw',
+        title: '1. Engine Oil & Filter Change (VW 1.8L TSI)',
+        vehicleId: 'v-jetta-2017',
+        category: 'Fluids',
+        intervalMiles: 5000,
+        intervalMonths: 6,
+        difficulty: 'Easy',
+        estimatedTime: '35 mins',
+        estimatedDiyCost: 45,
+        estimatedShopCost: 115,
+        requiredTools: [
+          '3/8" Drive Ratchet & Extensions',
+          'Metric Socket Set (8mm - 19mm)',
+          'Torx Bit Socket Set (T15 - T55)',
+          'Torque Wrench (3/8" Drive, 10-80 lb-ft)',
+          'Adjustable Oil Filter Wrench / Pliers',
+          'Oil Drain Pan & Spill-Free Funnel Set',
+          'Hydraulic Floor Jack & 3-Ton Jack Stands'
+        ],
+        requiredParts: [
+          { name: 'MAG 1 SAE 5W-30 Full Synthetic Euro Oil', qty: 6 },
+          { name: 'Mann Oil Filter (VW 1.8T)', qty: 1 }
+        ],
+        specsAndAdvice: 'Capacity: 5.7 Quarts of MAG 1 SAE 5W-30 Full Synthetic (VW 502 00). Remove lower belly pan using Torx T25 bit. Drain plug uses 19mm socket torqued to 22 lb-ft (30 Nm) with a fresh crush washer. Lubricate new Mann filter O-ring before tightening to 18 lb-ft.'
+      },
+      {
+        id: 'g-1b-oil-toyota',
+        title: '1B. Engine Oil & Cartridge Filter Change (Highlander 3.5L V6)',
+        vehicleId: 'v-highlander-2021',
+        category: 'Fluids',
+        intervalMiles: 5000,
+        intervalMonths: 6,
+        difficulty: 'Easy',
+        estimatedTime: '40 mins',
+        estimatedDiyCost: 44,
+        estimatedShopCost: 120,
+        requiredTools: [
+          '3/8" Drive Ratchet & Extensions',
+          'Metric Socket Set (8mm - 19mm)',
+          'Toyota 64mm 14-Flute Oil Filter Socket',
+          'Torque Wrench (3/8" Drive, 10-80 lb-ft)',
+          'Oil Drain Pan & Spill-Free Funnel Set',
+          'Hydraulic Floor Jack & 3-Ton Jack Stands'
+        ],
+        requiredParts: [
+          { name: '0W-20 Full Synthetic Motor Oil', qty: 6 },
+          { name: 'Toyota OEM Oil Filter Cartridge (04152-YZZA1)', qty: 1 }
+        ],
+        specsAndAdvice: 'Capacity: 6.1 Quarts SAE 0W-20 Full Synthetic. Requires a 64mm 14-flute cup socket to remove the Toyota cartridge oil filter housing without cracking it. Drain plug is 14mm torqued to 30 lb-ft; filter housing torques to 18 lb-ft.'
+      },
+      {
+        id: 'g-2-plugs-vw',
+        title: '2. Spark Plug Replacement (VW 1.8T — 5/8" Socket)',
+        vehicleId: 'v-jetta-2017',
+        category: 'Maintenance',
+        intervalMiles: 40000,
+        intervalMonths: 48,
+        difficulty: 'Moderate',
+        estimatedTime: '45 mins',
+        estimatedDiyCost: 56,
+        estimatedShopCost: 260,
+        requiredTools: [
+          '3/8" Drive Ratchet & Extensions',
+          '5/8" Magnetic Spark Plug Socket',
+          'Torque Wrench (3/8" Drive, 10-80 lb-ft)',
+          'Metric Socket Set (8mm - 19mm)',
+          'Torx Bit Socket Set (T15 - T55)'
+        ],
+        requiredParts: [
+          { name: 'NGK Laser Platinum Spark Plugs (VW 1.8T)', qty: 4 }
+        ],
+        specsAndAdvice: 'VW Jetta 1.8T uses a 5/8" Magnetic Spark Plug Socket with a 6" extension. Torque Spec: 22 lb-ft (30 Nm) on a cold engine! (Note: Toyota Highlander 3.5L V6 uses a 14mm thin-wall socket at 15 lb-ft). Remove 10mm coil harness ground nuts first and pull ignition coils straight up.'
+      },
+      {
+        id: 'g-3-front-brakes',
+        title: '3. Front Brake Pads & Rotors Service',
+        vehicleId: 'ALL',
+        category: 'Tires/Brakes',
+        intervalMiles: 45000,
+        intervalMonths: 48,
+        difficulty: 'Moderate',
+        estimatedTime: '75 mins',
+        estimatedDiyCost: 135,
+        estimatedShopCost: 440,
+        requiredTools: [
+          'Hydraulic Floor Jack & 3-Ton Jack Stands',
+          '17mm & 21mm Thin-Wall Deep Impact Sockets',
+          '1/2" Drive 24" Breaker Bar',
+          'Torque Wrench (1/2" Drive, 30-250 lb-ft)',
+          'Metric Socket Set (8mm - 19mm)',
+          'Metric Hex / Allen Bit Socket Set (4mm - 12mm)'
+        ],
+        requiredParts: [
+          { name: 'Non-Chlorinated Brake Parts Cleaner', qty: 1 }
+        ],
+        specsAndAdvice: 'Front caliper pistons press straight in (use an old brake pad and C-clamp or piston spreader). Clean rotor friction surfaces with Brake Parts Cleaner, grease slide pins with silicone paste, and torque caliper carrier bolts to spec. Lug torque: 89 lb-ft (VW) / 80 lb-ft (Toyota).'
+      },
+      {
+        id: 'g-4-rear-brakes',
+        title: '4. Rear Brake Pads & Rotors (Piston Wind-Back / EPB)',
+        vehicleId: 'ALL',
+        category: 'Tires/Brakes',
+        intervalMiles: 50000,
+        intervalMonths: 48,
+        difficulty: 'Advanced',
+        estimatedTime: '90 mins',
+        estimatedDiyCost: 145,
+        estimatedShopCost: 490,
+        requiredTools: [
+          'Hydraulic Floor Jack & 3-Ton Jack Stands',
+          '1/2" Drive 24" Breaker Bar',
+          'Torque Wrench (1/2" Drive, 30-250 lb-ft)',
+          'Metric Socket Set (8mm - 19mm)',
+          'Triple-Square (XZN) Bit Set (M6 - M16)',
+          'Brake Caliper Piston Wind-Back Kit',
+          'OBDII Diagnostic Scanner & EPB Tool'
+        ],
+        requiredParts: [
+          { name: 'Non-Chlorinated Brake Parts Cleaner', qty: 1 }
+        ],
+        specsAndAdvice: 'VW Jetta mechanical rear calipers MUST be rotated clockwise while pressing in using a Brake Caliper Piston Wind-Back Kit (free rental at AutoZone) and require an M14 Triple-Square bit for the carrier. Toyota Highlander uses an Electronic Parking Brake (put into EPB Service Mode via OBD tool or dash sequence before pressing piston).'
+      },
+      {
+        id: 'g-5-brake-flush',
+        title: '5. Brake Fluid Flush / Bleed (DOT 4 / DOT 3)',
+        vehicleId: 'ALL',
+        category: 'Fluids',
+        intervalMiles: 30000,
+        intervalMonths: 24,
+        difficulty: 'Moderate',
+        estimatedTime: '60 mins',
+        estimatedDiyCost: 26,
+        estimatedShopCost: 165,
+        requiredTools: [
+          'Hydraulic Floor Jack & 3-Ton Jack Stands',
+          '10mm & 11mm Flare Nut (Line) Wrench Set',
+          'One-Person Vacuum Brake Bleeder Kit',
+          'Nitrile Gloves & Safety Glasses'
+        ],
+        requiredParts: [
+          { name: 'DOT 4 Synthetic Brake Fluid', qty: 2 }
+        ],
+        specsAndAdvice: 'Flush every 2–3 years / 30k miles to prevent moisture corrosion in ABS valves. Bleed sequence: Rear Right -> Rear Left -> Front Right -> Front Left. Always use a 10mm/11mm Flare Nut Wrench on bleeder screws and never let the master cylinder reservoir run dry!'
+      },
+      {
+        id: 'g-6-coolant',
+        title: '6. Coolant Flush / Drain & Top-Off (Euro Violet / Toyota Pink)',
+        vehicleId: 'ALL',
+        category: 'Fluids',
+        intervalMiles: 30000,
+        intervalMonths: 24,
+        difficulty: 'Easy',
+        estimatedTime: '25 mins',
+        estimatedDiyCost: 19,
+        estimatedShopCost: 135,
+        requiredTools: [
+          'Oil Drain Pan & Spill-Free Funnel Set',
+          'Spring Hose Clamp Pliers & Pick Set',
+          'Nitrile Gloves & Safety Glasses'
+        ],
+        requiredParts: [
+          { name: 'Peak OET European Violet G12++/G13 50/50 Coolant', qty: 1 }
+        ],
+        specsAndAdvice: 'VW Jetta uses Peak European Violet G12++/G13 50/50 Prediluted. Highlander uses Toyota Super Long Life Pink 50/50. NEVER open a hot pressurized expansion cap! Fill to the cold MAX seam line and inspect water pump housing for seepage.'
+      },
+      {
+        id: 'g-11-tire-rotation',
+        title: '7. Tire Rotation & Precision Lug Torque Check',
+        vehicleId: 'ALL',
+        category: 'Tires/Brakes',
+        intervalMiles: 5000,
+        intervalMonths: 6,
+        difficulty: 'Easy',
+        estimatedTime: '30 mins',
+        estimatedDiyCost: 0,
+        estimatedShopCost: 40,
+        requiredTools: [
+          'Hydraulic Floor Jack & 3-Ton Jack Stands',
+          '17mm & 21mm Thin-Wall Deep Impact Sockets',
+          'Torque Wrench (1/2" Drive, 30-250 lb-ft)',
+          'M14x1.5 Wheel Hanger Alignment Pin',
+          '1/2" Drive 24" Breaker Bar'
+        ],
+        requiredParts: [],
+        specsAndAdvice: 'Rotate every 5,000 miles with oil change. Thread the M14x1.5 Wheel Hanger Pin into a VW hub hole so the wheel slides on effortlessly. Torque in a star pattern: 89 lb-ft (17mm socket) for VW Jetta; 80 lb-ft (21mm socket) for Toyota Highlander.'
+      },
+      {
+        id: 'g-12-taillight',
+        title: '8. Tail Light / Exterior Bulb Replacement (2825 Wedge)',
+        vehicleId: 'v-jetta-2017',
+        category: 'Repair',
+        intervalMiles: 50000,
+        intervalMonths: 48,
+        difficulty: 'Easy',
+        estimatedTime: '15 mins',
+        estimatedDiyCost: 4,
+        estimatedShopCost: 65,
+        requiredTools: [
+          'Nylon Trim & Panel Removal Tool Set',
+          'Phillips & Flathead Screwdriver Set',
+          'Nitrile Gloves & Safety Glasses'
+        ],
+        requiredParts: [
+          { name: '2825 Miniature Wedge Bulb (Tail Light)', qty: 1 }
+        ],
+        specsAndAdvice: 'Bulb Spec: 2825 (W5W) Miniature Wedge Bulb. Pop trunk carpet access trim panel using a nylon trim tool, unclip bulb tray, and push in new 2825 bulb wearing clean nitrile gloves so skin oils do not shorten bulb life.'
+      }
+    ];
+
+    const INITIAL_LOGS = [
+      {
+        id: 'log-1',
+        vehicleId: 'v-jetta-2017',
+        guideId: 'g-1-oil-vw',
+        date: '2026-09-18',
+        odometer: 166500,
+        serviceType: '1. Engine Oil & Filter Change (VW 1.8L TSI)',
+        category: 'Fluids',
+        performedBy: 'DIY',
+        cost: 41.50,
+        estimatedShopSavings: 73.50,
+        partsUsed: '5.7 qt MAG 1 SAE 5W-30 Full Synthetic Euro + Mann HU 7020 z Filter',
+        notes: 'Drained cleanly, replaced crush washer, torqued drain plug to 22 lb-ft. Next oil service due at 171,500 mi.',
+        receiptPhoto: null
+      },
+      {
+        id: 'log-2',
+        vehicleId: 'v-jetta-2017',
+        guideId: 'g-2-plugs-vw',
+        date: '2026-08-05',
+        odometer: 164800,
+        serviceType: '2. Spark Plug Replacement (VW 1.8T — 5/8" Socket)',
+        category: 'Maintenance',
+        performedBy: 'DIY',
+        cost: 54.99,
+        estimatedShopSavings: 205.00,
+        partsUsed: '4x NGK Laser Platinum Spark Plugs (94833)',
+        notes: 'Used 5/8" magnetic spark plug socket and 3/8" torque wrench set to 22 lb-ft. Smooth idle restored.',
+        receiptPhoto: null
+      },
+      {
+        id: 'log-3',
+        vehicleId: 'v-jetta-2017',
+        guideId: 'g-12-taillight',
+        date: '2026-07-12',
+        odometer: 163900,
+        serviceType: '8. Tail Light / Exterior Bulb Replacement (2825 Wedge)',
+        category: 'Repair',
+        performedBy: 'DIY',
+        cost: 6.49,
+        estimatedShopSavings: 58.50,
+        partsUsed: 'Sylvania 2825 Long Life Wedge Bulb (kept 1 spare on shelf)',
+        notes: 'Replaced burnt tail light 2825 bulb; dash warning light cleared immediately.',
+        receiptPhoto: null
+      },
+      {
+        id: 'log-4',
+        vehicleId: 'v-jetta-2017',
+        guideId: 'g-6-coolant',
+        date: '2026-06-20',
+        odometer: 162400,
+        serviceType: '6. Coolant Flush / Drain & Top-Off (Euro Violet / Toyota Pink)',
+        category: 'Fluids',
+        performedBy: 'DIY',
+        cost: 18.99,
+        estimatedShopSavings: 45.00,
+        partsUsed: 'Peak OET European Violet G12++/G13 50/50 Prediluted',
+        notes: 'Topped expansion reservoir up to MAX cold line. Stored remaining jug on Garage Shelf.',
+        receiptPhoto: null
+      }
+    ];
+
+    const TOOL_CATEGORIES = [
+      'Sockets & Bits',
+      'Wrenches & Ratchets',
+      'Specialty & Diagnostics',
+      'Lifting & Garage',
+      'Pliers & Drivers'
+    ];
+
+    const SERVICE_CATEGORIES = [
+      'Maintenance',
+      'Fluids',
+      'Tires/Brakes',
+      'Repair',
+      'Upgrade/Other'
+    ];
+
+    const SHELF_CATEGORIES = [
+      'Fluids',
+      'Filters',
+      'Ignition',
+      'Bulbs & Electrical',
+      'Brakes & Suspension',
+      'Shop Supplies'
+    ];
+
+    function App() {
+      const savedLocalState = useMemo(() => {
+        try {
+          const raw = localStorage.getItem(LOCAL_STORAGE_STATE_KEY);
+          return raw ? JSON.parse(raw) : null;
+        } catch (e) {
+          return null;
+        }
+      }, []);
+
+      const savedSupabaseCfg = useMemo(() => {
+        try {
+          const raw = localStorage.getItem(LOCAL_STORAGE_CONFIG_KEY);
+          return raw ? JSON.parse(raw) : null;
+        } catch (e) {
+          return null;
+        }
+      }, []);
+
+      const [vehicles, setVehicles] = useState(savedLocalState?.vehicles || INITIAL_VEHICLES);
+      const [selectedVehicleId, setSelectedVehicleId] = useState(
+        savedLocalState?.selectedVehicleId || INITIAL_VEHICLES[0].id
+      );
+      const [tools, setTools] = useState(savedLocalState?.tools || INITIAL_TOOLS);
+      const [shelf, setShelf] = useState(savedLocalState?.shelf || INITIAL_SHELF);
+      const [guides, setGuides] = useState(savedLocalState?.guides || INITIAL_GUIDES);
+      const [logs, setLogs] = useState(savedLocalState?.logs || INITIAL_LOGS);
+
+      const [supabaseUrl, setSupabaseUrl] = useState(
+        savedSupabaseCfg?.supabaseUrl || DEFAULT_SUPABASE_URL
+      );
+      const [supabaseAnonKey, setSupabaseAnonKey] = useState(
+        savedSupabaseCfg?.supabaseAnonKey || DEFAULT_SUPABASE_ANON_KEY
+      );
+      const [syncRoomCode, setSyncRoomCode] = useState(
+        savedSupabaseCfg?.syncRoomCode || DEFAULT_GARAGE_SYNC_CODE
+      );
+      const [clientId] = useState(
+        () => savedSupabaseCfg?.clientId || `dev-${Math.random().toString(36).slice(2, 10)}`
+      );
+
+      const isSupabaseConfigured = Boolean(supabaseUrl.trim() && supabaseAnonKey.trim());
+      const [cloudStatus, setCloudStatus] = useState(
+        isSupabaseConfigured ? 'connecting' : 'local-only'
+      );
+      const [cloudErrorMsg, setCloudErrorMsg] = useState('');
+      const [lastSyncedAt, setLastSyncedAt] = useState(null);
+      const [isPhoneModalOpen, setIsPhoneModalOpen] = useState(false);
+
+      const isApplyingRemoteUpdate = React.useRef(false);
+      const hasLoadedInitialCloud = React.useRef(false);
+      const lastSyncedPayloadHash = React.useRef('');
+
+      useEffect(() => {
+        try {
+          localStorage.setItem(
+            LOCAL_STORAGE_STATE_KEY,
+            JSON.stringify({
+              vehicles,
+              selectedVehicleId,
+              tools,
+              shelf,
+              guides,
+              logs,
+              savedAt: new Date().toISOString()
+            })
+          );
+        } catch (e) {}
+      }, [vehicles, selectedVehicleId, tools, shelf, guides, logs]);
+
+      useEffect(() => {
+        try {
+          localStorage.setItem(
+            LOCAL_STORAGE_CONFIG_KEY,
+            JSON.stringify({
+              supabaseUrl,
+              supabaseAnonKey,
+              syncRoomCode,
+              clientId
+            })
+          );
+        } catch (e) {}
+      }, [supabaseUrl, supabaseAnonKey, syncRoomCode, clientId]);
+
+      const applyRemotePayload = React.useCallback((payload, timestampLabel) => {
+        if (!payload || typeof payload !== 'object') return;
+        const incomingHash = JSON.stringify(payload);
+        if (incomingHash === lastSyncedPayloadHash.current) return;
+
+        lastSyncedPayloadHash.current = incomingHash;
+        isApplyingRemoteUpdate.current = true;
+
+        if (Array.isArray(payload.vehicles) && payload.vehicles.length > 0) {
+          setVehicles(payload.vehicles);
+        }
+        if (payload.selectedVehicleId) {
+          setSelectedVehicleId(payload.selectedVehicleId);
+        }
+        if (Array.isArray(payload.tools)) setTools(payload.tools);
+        if (Array.isArray(payload.shelf)) setShelf(payload.shelf);
+        if (Array.isArray(payload.guides)) setGuides(payload.guides);
+        if (Array.isArray(payload.logs)) setLogs(payload.logs);
+
+        setCloudStatus('synced');
+        setCloudErrorMsg('');
+        setLastSyncedAt(
+          timestampLabel
+            ? new Date(timestampLabel).toLocaleTimeString()
+            : new Date().toLocaleTimeString()
+        );
+
+        setTimeout(() => {
+          isApplyingRemoteUpdate.current = false;
+        }, 150);
+      }, []);
+
+      const handleManualPullFromSupabase = React.useCallback(
+        async (silent = false) => {
+          if (!supabaseUrl.trim() || !supabaseAnonKey.trim()) {
+            setCloudStatus('local-only');
+            return false;
+          }
+          const cleanRoom = (syncRoomCode || 'DEFAULT-GARAGE').trim().toUpperCase();
+          setCloudStatus('syncing');
+          try {
+            const row = await supabaseRestPull(supabaseUrl, supabaseAnonKey, cleanRoom);
+            if (row && row.payload) {
+              applyRemotePayload(row.payload, row.updated_at);
+              hasLoadedInitialCloud.current = true;
+              if (!silent) showToast(`Pulled latest garage state (${cleanRoom})!`);
+              return true;
+            } else {
+              const currentPayload = { vehicles, selectedVehicleId, tools, shelf, guides, logs };
+              lastSyncedPayloadHash.current = JSON.stringify(currentPayload);
+              await supabaseRestPush(supabaseUrl, supabaseAnonKey, cleanRoom, currentPayload, clientId);
+              hasLoadedInitialCloud.current = true;
+              setCloudStatus('synced');
+              setCloudErrorMsg('');
+              setLastSyncedAt(new Date().toLocaleTimeString());
+              if (!silent) showToast(`Initialized Supabase room "${cleanRoom}"!`);
+              return true;
+            }
+          } catch (err) {
+            setCloudStatus('error');
+            setCloudErrorMsg(err.message || 'Failed to connect to Supabase');
+            return false;
+          }
+        },
+        [supabaseUrl, supabaseAnonKey, syncRoomCode, vehicles, selectedVehicleId, tools, shelf, guides, logs, clientId, applyRemotePayload]
+      );
+
+      useEffect(() => {
+        if (!supabaseUrl.trim() || !supabaseAnonKey.trim()) {
+          setCloudStatus('local-only');
+          setCloudErrorMsg('');
+          hasLoadedInitialCloud.current = false;
+          return;
+        }
+        let isMounted = true;
+        const cleanRoom = (syncRoomCode || 'DEFAULT-GARAGE').trim().toUpperCase();
+        handleManualPullFromSupabase(true);
+
+        const checkRemoteChanges = async () => {
+          if (!isMounted || isApplyingRemoteUpdate.current) return;
+          try {
+            const row = await supabaseRestPull(supabaseUrl, supabaseAnonKey, cleanRoom);
+            if (row && row.payload && row.client_id !== clientId) {
+              applyRemotePayload(row.payload, row.updated_at);
+            }
+          } catch (e) {}
+        };
+
+        const pollInterval = setInterval(checkRemoteChanges, 3500);
+        return () => {
+          isMounted = false;
+          clearInterval(pollInterval);
+        };
+      }, [supabaseUrl, supabaseAnonKey, syncRoomCode, clientId, handleManualPullFromSupabase, applyRemotePayload]);
+
+      useEffect(() => {
+        if (
+          !supabaseUrl.trim() ||
+          !supabaseAnonKey.trim() ||
+          !hasLoadedInitialCloud.current ||
+          isApplyingRemoteUpdate.current
+        ) {
+          return;
+        }
+        const currentPayload = { vehicles, selectedVehicleId, tools, shelf, guides, logs };
+        const payloadHash = JSON.stringify(currentPayload);
+        if (payloadHash === lastSyncedPayloadHash.current) return;
+
+        const cleanRoom = (syncRoomCode || 'DEFAULT-GARAGE').trim().toUpperCase();
+        setCloudStatus('syncing');
+
+        const debounceTimer = setTimeout(async () => {
+          try {
+            lastSyncedPayloadHash.current = payloadHash;
+            await supabaseRestPush(supabaseUrl, supabaseAnonKey, cleanRoom, currentPayload, clientId);
+            setCloudStatus('synced');
+            setCloudErrorMsg('');
+            setLastSyncedAt(new Date().toLocaleTimeString());
+          } catch (err) {
+            setCloudStatus('error');
+            setCloudErrorMsg(err.message || 'Auto-sync error');
+          }
+        }, 400);
+
+        return () => clearTimeout(debounceTimer);
+      }, [vehicles, selectedVehicleId, tools, shelf, guides, logs, supabaseUrl, supabaseAnonKey, syncRoomCode, clientId]);
+
+      const [activeTab, setActiveTab] = useState('dashboard');
+      const [toast, setToast] = useState(null);
+      const [logSearch, setLogSearch] = useState('');
+      const [guideFilter, setGuideFilter] = useState('VEHICLE');
+      const [toolSearch, setToolSearch] = useState('');
+      const [isOdometerModalOpen, setIsOdometerModalOpen] = useState(false);
+      const [tempOdometer, setTempOdometer] = useState('');
+      const [isLogModalOpen, setIsLogModalOpen] = useState(false);
+      const [editingLog, setEditingLog] = useState(null);
+
+      const showToast = (message, type = 'success') => {
+        setToast({ message, type });
+        setTimeout(() => {
+          setToast((prev) => (prev?.message === message ? null : prev));
+        }, 3500);
+      };
+
+      const activeVehicle = useMemo(
+        () => vehicles.find((v) => v.id === selectedVehicleId) || vehicles[0] || null,
+        [vehicles, selectedVehicleId]
+      );
+
+      const evaluateToolReadiness = useMemo(() => {
+        const toolMap = new Map();
+        tools.forEach((t) => toolMap.set(t.name.toLowerCase().trim(), t));
+        return (requiredToolNames = []) => {
+          const details = requiredToolNames.map((reqName) => {
+            const match = toolMap.get(reqName.toLowerCase().trim());
+            return {
+              name: reqName,
+              owned: match ? Boolean(match.owned) : false,
+              loanerAvailable: match ? Boolean(match.loanerAvailable) : false,
+              estBuyPrice: match ? Number(match.estBuyPrice || 20) : 20
+            };
+          });
+          const missingCount = details.filter((d) => !d.owned).length;
+          return {
+            isReady: missingCount === 0,
+            missingCount,
+            totalCount: details.length,
+            details
+          };
+        };
+      }, [tools]);
+
+      const handleToggleToolByName = (toolName) => {
+        const existing = tools.find((t) => t.name.toLowerCase().trim() === toolName.toLowerCase().trim());
+        if (existing) {
+          const nextOwned = !existing.owned;
+          setTools((prev) => prev.map((t) => (t.id === existing.id ? { ...t, owned: nextOwned } : t)));
+          showToast(nextOwned ? `Marked "${existing.name}" as Owned!` : `Marked "${existing.name}" as Missing.`);
+        }
+      };
+
+      const ownedToolsCount = tools.filter((t) => t.owned).length;
+      const totalShelfItems = shelf.reduce((acc, s) => acc + (Number(s.quantity) > 0 ? 1 : 0), 0);
+
+      const filteredLogs = useMemo(() => {
+        return logs
+          .filter((l) => (activeVehicle ? l.vehicleId === activeVehicle.id : true))
+          .filter((l) => {
+            if (!logSearch.trim()) return true;
+            const q = logSearch.toLowerCase();
+            return (
+              l.serviceType.toLowerCase().includes(q) ||
+              (l.partsUsed && l.partsUsed.toLowerCase().includes(q)) ||
+              (l.notes && l.notes.toLowerCase().includes(q))
+            );
+          })
+          .sort((a, b) => new Date(b.date) - new Date(a.date));
+      }, [logs, activeVehicle, logSearch]);
+
+      return (
+        <div className="min-h-screen pb-20 md:pb-10 bg-slate-950 text-slate-100 flex flex-col">
+          {toast && (
+            <div className="fixed bottom-20 md:bottom-5 right-4 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-slate-900 border border-emerald-500/40 text-slate-100 shadow-2xl">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              <span className="text-xs font-medium">{toast.message}</span>
+            </div>
+          )}
+
+          {/* Header */}
+          <header className="sticky top-0 z-30 bg-slate-900/95 backdrop-blur border-b border-slate-800">
+            <div className="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-emerald-500 flex items-center justify-center text-slate-950 font-bold">
+                  <Wrench className="w-5 h-5" />
+                </div>
+                <div>
+                  <h1 className="text-base font-bold text-white">
+                    Garage<span className="text-emerald-400">Command</span> PRO
+                  </h1>
+                  <p className="text-[11px] text-slate-400 hidden sm:block">
+                    Standalone Mobile & Desktop Edition
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={selectedVehicleId}
+                  onChange={(e) => setSelectedVehicleId(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs font-semibold text-white"
+                >
+                  {vehicles.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.year} {v.make} {v.model} ({Number(v.odometer).toLocaleString()} mi)
+                    </option>
+                  ))}
+                </select>
+
+                <button
+                  onClick={() => setIsPhoneModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700"
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  {cloudStatus === 'synced' ? 'Supabase Live' : 'Cloud Sync'}
+                </button>
+              </div>
+            </div>
+
+            {/* Desktop Nav */}
+            <div className="max-w-7xl mx-auto px-4 pb-2 hidden md:flex items-center gap-2">
+              {['dashboard', 'guides', 'shelf', 'tools', 'garage'].map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold capitalize transition ${
+                    activeTab === tab
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {tab === 'dashboard' ? 'Service Ledger' : tab}
+                </button>
+              ))}
+            </div>
+          </header>
+
+          {/* Active Vehicle Banner */}
+          {activeVehicle && (
+            <div className="bg-slate-900/60 border-b border-slate-800 px-4 py-2.5">
+              <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <strong className="text-white text-sm">
+                    {activeVehicle.year} {activeVehicle.make} {activeVehicle.model}
+                  </strong>
+                  <span className="px-2 py-0.5 rounded bg-slate-800 text-emerald-400">
+                    Oil: {activeVehicle.oilSpec}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-slate-800 text-purple-300">
+                    Coolant: {activeVehicle.coolantSpec}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 font-mono">
+                  <span>Odometer: {Number(activeVehicle.odometer).toLocaleString()} mi</span>
+                  <button
+                    onClick={() => {
+                      const next = prompt('Enter new odometer reading:', activeVehicle.odometer);
+                      if (next && !isNaN(parseInt(next, 10))) {
+                        setVehicles((prev) =>
+                          prev.map((v) =>
+                            v.id === activeVehicle.id ? { ...v, odometer: parseInt(next, 10) } : v
+                          )
+                        );
+                      }
+                    }}
+                    className="text-emerald-400 underline"
+                  >
+                    Edit
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Main Content */}
+          <main className="max-w-7xl w-full mx-auto px-4 py-5 space-y-5 flex-1">
+            {activeTab === 'dashboard' && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-base font-bold text-white">Service & Expense Ledger</h2>
+                  <input
+                    type="text"
+                    value={logSearch}
+                    onChange={(e) => setLogSearch(e.target.value)}
+                    placeholder="Search logs..."
+                    className="bg-slate-900 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-white"
+                  />
+                </div>
+                <div className="space-y-2.5">
+                  {filteredLogs.map((log) => (
+                    <div
+                      key={log.id}
+                      className="p-4 rounded-2xl bg-slate-900 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-sm text-white">{log.serviceType}</span>
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
+                            {log.performedBy}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          {log.date} • {Number(log.odometer).toLocaleString()} mi • {log.partsUsed}
+                        </p>
+                        {log.notes && <p className="text-xs text-slate-300 mt-1">{log.notes}</p>}
+                      </div>
+                      <div className="text-right font-mono font-bold text-emerald-400">
+                        ${Number(log.cost).toFixed(2)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'guides' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {guides
+                  .filter((g) => !activeVehicle || g.vehicleId === activeVehicle.id || g.vehicleId === 'ALL')
+                  .map((guide) => {
+                    const readiness = evaluateToolReadiness(guide.requiredTools);
+                    return (
+                      <div
+                        key={guide.id}
+                        className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span
+                            className={`text-xs font-bold px-2.5 py-0.5 rounded-full ${
+                              readiness.isReady
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-amber-500/20 text-amber-300'
+                            }`}
+                          >
+                            {readiness.isReady
+                              ? 'READY TO DIY'
+                              : `MISSING ${readiness.missingCount} TOOL(S)`}
+                          </span>
+                          <span className="text-xs text-slate-400">
+                            Every {Number(guide.intervalMiles).toLocaleString()} mi
+                          </span>
+                        </div>
+                        <h3 className="text-sm font-bold text-white">{guide.title}</h3>
+                        <p className="text-xs text-slate-300 leading-relaxed">{guide.specsAndAdvice}</p>
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {readiness.details.map((t, i) => (
+                            <button
+                              key={i}
+                              onClick={() => handleToggleToolByName(t.name)}
+                              className={`px-2 py-1 rounded-lg text-[11px] font-medium border ${
+                                t.owned
+                                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                                  : 'bg-rose-500/10 border-rose-500/40 text-rose-300'
+                              }`}
+                            >
+                              {t.owned ? '✓ ' : '✗ '}
+                              {t.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+
+            {activeTab === 'shelf' && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {shelf.map((item) => (
+                  <div
+                    key={item.id}
+                    className="p-4 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-between"
+                  >
+                    <div>
+                      <span className="text-[10px] uppercase text-cyan-400 font-bold">{item.category}</span>
+                      <h4 className="text-sm font-bold text-white">{item.name}</h4>
+                      <span className="text-xs text-slate-400 font-mono">{item.partNumber}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() =>
+                          setShelf((prev) =>
+                            prev.map((s) =>
+                              s.id === item.id ? { ...s, quantity: Math.max(0, s.quantity - 1) } : s
+                            )
+                          )
+                        }
+                        className="p-1.5 rounded bg-slate-800 text-white"
+                      >
+                        -
+                      </button>
+                      <span className="font-mono font-bold text-base text-emerald-400">
+                        {item.quantity}
+                      </span>
+                      <button
+                        onClick={() =>
+                          setShelf((prev) =>
+                            prev.map((s) =>
+                              s.id === item.id ? { ...s, quantity: s.quantity + 1 } : s
+                            )
+                          )
+                        }
+                        className="p-1.5 rounded bg-emerald-500/20 text-emerald-300"
+                      >
+                        +
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {activeTab === 'tools' && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {tools.map((tool) => (
+                  <div
+                    key={tool.id}
+                    onClick={() => handleToggleToolByName(tool.name)}
+                    className={`p-3.5 rounded-2xl border cursor-pointer flex items-center justify-between ${
+                      tool.owned
+                        ? 'bg-slate-900 border-emerald-500/30'
+                        : 'bg-slate-900/50 border-slate-800'
+                    }`}
+                  >
+                    <div>
+                      <span className="text-[10px] text-slate-400 block">{tool.category}</span>
+                      <h4 className="text-xs font-bold text-white">{tool.name}</h4>
+                    </div>
+                    <span
+                      className={`px-2 py-1 rounded text-[11px] font-bold ${
+                        tool.owned ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {tool.owned ? 'Owned' : 'Missing'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {activeTab === 'garage' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {vehicles.map((v) => (
+                  <div key={v.id} className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-2">
+                    <h3 className="text-base font-bold text-white">
+                      {v.year} {v.make} {v.model} ({v.trim})
+                    </h3>
+                    <p className="text-xs text-slate-300">Oil: {v.oilSpec}</p>
+                    <p className="text-xs text-slate-300">Coolant: {v.coolantSpec}</p>
+                    <p className="text-xs text-slate-300">Spark Plugs: {v.sparkPlugSpec}</p>
+                    <p className="text-xs text-slate-400">{v.notes}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </main>
+
+          {/* Supabase Setup Modal */}
+          {isPhoneModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-5 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-bold text-white">Supabase Cloud Sync Setup</h3>
+                  <button onClick={() => setIsPhoneModalOpen(false)} className="text-slate-400">
+                    ✕
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Supabase Project URL or Reference ID"
+                  value={supabaseUrl}
+                  onChange={(e) => setSupabaseUrl(normalizeSupabaseUrl(e.target.value))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono"
+                />
+                <input
+                  type="password"
+                  placeholder="Supabase Anon Public Key"
+                  value={supabaseAnonKey}
+                  onChange={(e) => setSupabaseAnonKey(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono"
+                />
+                <input
+                  type="text"
+                  placeholder="Garage Sync Code (e.g. JETTA-GARAGE-1)"
+                  value={syncRoomCode}
+                  onChange={(e) => setSyncRoomCode(e.target.value.toUpperCase())}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-emerald-400 font-mono font-bold"
+                />
+                <div className="flex justify-end gap-2">
+                  <button
+                    onClick={() => {
+                      handleManualPullFromSupabase(false);
+                      setIsPhoneModalOpen(false);
+                    }}
+                    className="px-4 py-2 rounded-xl text-xs font-bold bg-emerald-500 text-slate-950"
+                  >
+                    Save & Sync
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Mobile Bottom Bar */}
+          <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex justify-around py-2 z-40">
+            {['dashboard', 'guides', 'tools', 'shelf', 'garage'].map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`text-[11px] font-bold capitalize px-2 py-1 rounded ${
+                  activeTab === tab ? 'text-emerald-400' : 'text-slate-400'
+                }`}
+              >
+                {tab === 'dashboard' ? 'Ledger' : tab}
+              </button>
+            ))}
+          </nav>
+        </div>
+      );
+    }
+
+    const root = createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
